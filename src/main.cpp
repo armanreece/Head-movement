@@ -109,7 +109,7 @@ const float   TILT_REST_OFFSET_DEG = 30;   // horn degrees from 1500 us
 const float   PAN_REST_OFFSET_DEG  = -70;  // measured at the bench 4 Sep 2026
 // The -90 that was here bought an upright head and cost every bit of travel
 // on one side, which is arithmetic, not bad luck. A servo lives in
-// 500-2500 us. Rest 90 degrees anticlockwise of centre is 501 us, which
+// 500-2500 us. Rest 90 degrees anticlockwise of centre is 501 us, w hich
 // leaves 1 us of room below it - the servo is sitting ON its end stop, and
 // no travel setting recovers that side. Nor does negating the travel: that
 // only swaps which direction is the dead one.
@@ -145,9 +145,50 @@ NeckAxis neckTilt = { TILT_CH, TILT_REST_US, TILT_TRAVEL_DEG, NECK_US_PER_DEG };
 
 Neck neck(bank, neckPan, neckTilt);
 
-// ---- Swivel ----  *** REBUILT 3 Sep 2026: gear drive, continuous servo ***
+// ---- WHICH SWIVEL MOTOR? ----  *** 11 Sep 2026: new motor on channel 6 ***
 //
-// A continuous-rotation micro servo on channel 2, pinion glued to its horn,
+// Set SWIVEL_MOTOR to match the servo now on channel 6. Until you do, the
+// swivel is OFF: channel 6 gets no pulse at all and Y commands are ignored.
+//
+//   SWIVEL_POSITIONAL - an ordinary 180 or 270 degree servo. The pulse sets an
+//                       ANGLE, so it can crawl smoothly, and where it points is
+//                       exact: no drift, nothing to re-zero. Uses TURN_ below.
+//   SWIVEL_CONTINUOUS - a "360" / continuous-rotation servo. The pulse sets a
+//                       SPEED and where the head points is only an estimate.
+//                       Uses the SWIVEL_ numbers further down and needs
+//                       SWIVEL_CAL_MODE first. It cannot truly crawl: below
+//                       SWIVEL_SLOW_DEG_S it can only move in short bursts.
+//
+// NOT SURE WHICH? The label or listing says 180 / 270 (positional) or 360 /
+// continuous. Or set NECK_CAL_CH = 6 in the Behaviour block and jog it from
+// 1500 in 10 us steps: a positional servo moves a little and HOLDS there, a
+// continuous one keeps TURNING for as long as the pulse is off its stop.
+#define SWIVEL_NONE       0
+#define SWIVEL_POSITIONAL 1
+#define SWIVEL_CONTINUOUS 2
+#define SWIVEL_MOTOR      SWIVEL_NONE
+
+const bool    TURN_ENABLED   = (SWIVEL_MOTOR == SWIVEL_POSITIONAL);
+const bool    SWIVEL_ENABLED = (SWIVEL_MOTOR == SWIVEL_CONTINUOUS);
+const uint8_t SWIVEL_CH      = 6;
+
+// ---- Positional swivel (SWIVEL_POSITIONAL) ----
+// pulse = TURN_CENTRE_US + (Y / 100) * TURN_TRAVEL_US, eased very slowly.
+// MEASURE both with the jog tool (NECK_CAL_CH = 6), head fitted:
+//   TURN_CENTRE_US - the pulse where the head faces straight ahead
+//   TURN_TRAVEL_US - how far either side of that is safe for the cables, in us,
+//                    minus a margin; the SMALLER side if they differ. SIGNED:
+//                    flip it if Y+ turns the head the opposite way to E+.
+// A positional servo jumps to its pulse at full speed the moment it powers
+// up, so centre the head by hand before switching on.
+const float TURN_CENTRE_US    = 1500;  // MEASURE
+const float TURN_TRAVEL_US    = 150;   // MEASURE - deliberately small until you have
+const float TURN_SPEED_PCT_S  = 12;    // top speed, percent of travel per second: very slow
+const float TURN_ACCEL_PCT_S2 = 20;    // gentle start and stop
+
+// ---- Continuous swivel (SWIVEL_CONTINUOUS) ----  *** REBUILT 3 Sep 2026 ***
+//
+// A continuous-rotation servo on channel 6 (was 2), pinion glued to its horn,
 // driving the ring gear the head's base bolts to at about 4:1. The gear
 // ratio itself never appears in the code: both speeds below are measured
 // at the HEAD, so whatever the teeth count is, it is already in them.
@@ -170,9 +211,6 @@ Neck neck(bank, neckPan, neckTilt);
 // rotation for geometric reasons. This mechanism has no over-centre limit,
 // so the travel is now a software choice - SWIVEL_MAX_DEG - not a mechanical
 // accident.
-const bool SWIVEL_ENABLED = true;
-
-const uint8_t SWIVEL_CH      = 2;
 const int8_t  SWIVEL_DIR     = +1;     // flip to -1 if Y+ turns the head LEFT
 const float   SWIVEL_STOP_US = 1500;   // nominal. Cal mode step 1 checks it.
 const float   SWIVEL_SLOW_US = 60;     // offset that just reliably moves the head
@@ -273,7 +311,10 @@ const float    SWIVEL_HOME_HALF_WIDTH_DEG = 3.0f; // WINDOW: half the arc it rea
 // Idle glances are deliberately unhurried - a resting person does not whip
 // their head round. Driven turns (tracking a face) can be brisker.
 const float SWIVEL_IDLE_SPEED   = 35;
-const float SWIVEL_DRIVEN_SPEED = 70;
+const float SWIVEL_DRIVEN_SPEED = 20;   // following a face: as slow as the servo allows
+// Idle glances when no Pi is connected. OFF for a new, uncalibrated motor:
+// with it off the head just returns to centre when the Pi stops driving.
+const bool  SWIVEL_IDLE_GLANCES = false;
 const float SWIVEL_ACCEL        = 110;  // deg/s^2. Lower = gentler ease in/out
 const unsigned int SWIVEL_EYE_LEAD_MS = 180;  // eyes go first, head follows this much later
 
@@ -288,13 +329,50 @@ SwivelConfig swivelCfg = {
 };
 Swivel swivel(bank, swivelCfg);
 
+// Positional swivel: a target in percent, eased towards at a very slow top
+// speed with a gentle start and stop. Only used when TURN_ENABLED.
+class HeadTurn {
+public:
+  void begin()               { last = millis(); write(); }
+  void setYaw(float percent) { target = constrain(percent, -100.0f, 100.0f); }
+  void update() {
+    unsigned long now = millis();
+    float dt = (float)(now - last) / 1000.0f;
+    last = now;
+    if (dt > 0.1f) dt = 0.1f;
+    float err = target - pos;
+    // The fastest speed it can still stop from before the target, capped.
+    float want = sqrt(2.0f * TURN_ACCEL_PCT_S2 * fabs(err));
+    if (want > TURN_SPEED_PCT_S) want = TURN_SPEED_PCT_S;
+    if (err < 0.0f) want = -want;
+    float dv = want - vel;
+    float maxDv = TURN_ACCEL_PCT_S2 * dt;
+    if (dv >  maxDv) dv =  maxDv;
+    if (dv < -maxDv) dv = -maxDv;
+    vel += dv;
+    float step = vel * dt;
+    if (fabs(err) < 0.05f || (err > 0.0f && step >= err) || (err < 0.0f && step <= err)) {
+      pos = target;             // arrive exactly, never overshoot
+      vel = 0.0f;
+    } else {
+      pos += step;
+    }
+    write();
+  }
+private:
+  void write() { bank.setPulseUs(SWIVEL_CH, TURN_CENTRE_US + pos / 100.0f * TURN_TRAVEL_US); }
+  float pos = 0.0f, vel = 0.0f, target = 0.0f;
+  unsigned long last = 0;
+};
+HeadTurn headTurn;
+
 // ---- Eyes ----
 // Three servos per eye, driving each frame through wire pushrods. One servo
 // in each bank is a 270-degree unit, so commanded degrees are ~1.5x real
 // degrees there - treat every number below as units found by testing, not
 // as protractor angles.
 //
-// EVERYTHING IS REST + OFFSET. Each servo has ONE rest angle - the position
+// EVERYTHING IS REST +eyes OFFSET. Each servo has ONE rest angle - the position
 // its mechanism was assembled in - and a signed travel from there. At rest
 // every servo is commanded to exactly its rest angle, and every movement
 // returns to it. There are no absolute target angles anywhere.
@@ -310,8 +388,8 @@ Swivel swivel(bank, swivelCfg);
 // LEFT EYE - calibrated and working (1 Sep 2026)
 const int L_PAN_CH   = 8,  L_TILT_CH  = 9,  L_LID_CH  = 10;
 const int L_PAN_REST = 45,  L_PAN_TRAVEL  = 40;   // +ve = eyes right
-const int L_TILT_REST = 155, L_TILT_TRAVEL = -35; // +ve = eyes up
-const int L_LID_REST = 125, L_LID_TRAVEL  = -78;  // rest = open
+const int L_TILT_REST = 50, L_TILT_TRAVEL = -35; // +ve = eyes up
+const int L_LID_REST = 115, L_LID_TRAVEL  = -78;  // rest = open
 
 // RIGHT EYE - STARTING GUESSES, NOT CALIBRATED.
 // Channels are assumed to be 11, 12, 13. CHECK THE ACTUAL WIRING and change
@@ -449,7 +527,7 @@ const bool NECK_IDLE_MOTION = true;
 // against the pulley where it now sits. Set false, re-upload.
 const bool  NECK_FIT_REST     = false;
 
-const int   NECK_CAL_CH       = 0;      // 0 = off, 4 = tilt, 5 = pan
+const int   NECK_CAL_CH       = 0;      // 0 = off, 4 = tilt, 5 = pan, 6 = swivel
 const float NECK_CAL_START_US = 1500;
 const float NECK_CAL_MIN_US   = 800;    // safe either side of any viable rest
 const float NECK_CAL_MAX_US   = 2200;
@@ -567,8 +645,14 @@ void enterAutonomous() {
   eyeLeadRelease = 0;
   if (SWIVEL_ENABLED) {
     swivel.hold();              // kills any rate command the Pi left running
-    swivel.setWander(true);
+    if (SWIVEL_IDLE_GLANCES) {
+      swivel.setWander(true);
+    } else {
+      swivel.setWander(false);
+      swivel.setYaw(0);         // no glances: just come back to centre
+    }
   }
+  if (TURN_ENABLED) headTurn.setYaw(0);   // Pi gone: ease back to centre
   jaw.setGape(0);
   nextSpeech = millis() + 1000;
   Serial.println(F("# autonomous"));
@@ -659,16 +743,23 @@ void setup() {
     while (true) { delay(1000); }
   }
 
-  if (NECK_CAL_CH == TILT_CH || NECK_CAL_CH == PAN_CH) {
+  if (NECK_CAL_CH == TILT_CH || NECK_CAL_CH == PAN_CH || NECK_CAL_CH == SWIVEL_CH) {
     float us = NECK_CAL_START_US;
-    Serial.println(F("--- neck rest finder ---"));
+    Serial.println(F("--- rest finder ---"));
     Serial.print(F("channel "));
-    Serial.print(NECK_CAL_CH);
-    Serial.println((NECK_CAL_CH == TILT_CH) ? F("  (tilt)") : F("  (pan)"));
-    Serial.println(F("TAKE THE STRING LOOP OFF THIS PULLEY FIRST."));
+    Serial.println(NECK_CAL_CH);
     Serial.println(F("type: a pulse in us, or + - (10 us), ++ -- (100 us)"));
-    Serial.println(F("stop when the horn is PARALLEL to the long side of"));
-    Serial.println(F("the servo body. that pulse is this axis's REST_US."));
+    if (NECK_CAL_CH == SWIVEL_CH) {
+      Serial.println(F("swivel. KEEP STEPS SMALL - mind the cables."));
+      Serial.println(F("moves then HOLDS: positional. note the pulse facing"));
+      Serial.println(F("straight ahead (TURN_CENTRE_US) and the safe limit"));
+      Serial.println(F("each way (TURN_TRAVEL_US = smaller distance)."));
+      Serial.println(F("keeps TURNING: continuous. type the pulse that stops it."));
+    } else {
+      Serial.println(F("TAKE THE STRING LOOP OFF THIS PULLEY FIRST."));
+      Serial.println(F("stop when the horn is PARALLEL to the long side of"));
+      Serial.println(F("the servo body. that pulse is this axis's REST_US."));
+    }
     bank.setPulseUs((uint8_t)NECK_CAL_CH, us);
     Serial.print(F("  "));
     Serial.println(us, 0);
@@ -725,6 +816,7 @@ void setup() {
     swivel.setAccel(SWIVEL_ACCEL);
     swivel.setEyeLead(SWIVEL_EYE_LEAD_MS);
   }
+  if (TURN_ENABLED) headTurn.begin();
   jaw.begin();
 
   Serial.print(F("# neck tilt: "));
@@ -758,7 +850,7 @@ void setup() {
     while (true) { delay(1000); }   // stop here; nothing else should run
   }
 
-  if (SWIVEL_CAL_MODE) {
+  if (SWIVEL_CAL_MODE && SWIVEL_ENABLED) {
     swivel.calibrate();
     while (true) { delay(1000); }
   }
@@ -771,6 +863,16 @@ void setup() {
     } else {
       Serial.println(F("# swivel: no home sensor, assuming head is straight"));
     }
+  } else if (TURN_ENABLED) {
+    Serial.print(F("# swivel: positional, ch "));
+    Serial.print(SWIVEL_CH);
+    Serial.print(F(", centre "));
+    Serial.print(TURN_CENTRE_US, 0);
+    Serial.print(F(" us, travel "));
+    Serial.print(TURN_TRAVEL_US, 0);
+    Serial.println(F(" us"));
+  } else {
+    Serial.println(F("# swivel: OFF - set SWIVEL_MOTOR in main.cpp"));
   }
 
   if (RUN_DEMO) {
@@ -836,6 +938,7 @@ void loop() {
       if (comms.yawUpdated())    swivel.setYaw(comms.yawPercent());
       if (comms.rateUpdated())   swivel.setRate(comms.ratePercent());
     }
+    if (TURN_ENABLED && comms.yawUpdated()) headTurn.setYaw(comms.yawPercent());
     if (comms.eyesUpdated())     eyes.look(comms.eyeX(), comms.eyeY());
     if (comms.lidUpdated())      eyes.setLids(comms.lidPercent());
     if (comms.blinkRequested())  eyes.blink();
@@ -850,5 +953,6 @@ void loop() {
   neck.update();
   eyes.update();
   if (SWIVEL_ENABLED) swivel.update();
+  if (TURN_ENABLED)   headTurn.update();
   jaw.update();
 }
